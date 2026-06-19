@@ -1,0 +1,380 @@
+from pathlib import Path
+import re
+import os
+import subprocess
+import tempfile
+from PIL import Image, ImageDraw, ImageFont
+import matplotlib.font_manager as fm
+
+# --- settings ---
+INPUT_FILE = Path("44.txt")
+OUTPUT_VIDEO = INPUT_FILE.with_suffix(".mp4")
+AUDIO_FILE = INPUT_FILE.with_suffix(".mp3")          # audio file (same base name)
+OUTPUT_DIR = Path("frames")                          # temp folder for PNGs (ffmpeg fallback)
+W, H = 1280, 720
+BG = (0, 0, 0)
+FG = (255, 255, 255)
+MARGIN_X = 90
+MARGIN_Y = 70
+SPACING = 10
+
+# If True, each physical line inside a subtitle block becomes its own frame
+# with the same duration as the whole block (not recommended for video).
+SPLIT_INTO_LINES = False
+
+# --- font finder (unchanged) ---
+def find_font():
+    preferred_names = [
+        "Futura Condensed Extra",
+        "Futura Condensed",
+        "Futura",
+        "Arial Narrow",
+        "Liberation Sans Narrow",
+        "DejaVu Sans Condensed",
+    ]
+    font_files = (
+        fm.findSystemFonts(fontpaths=None, fontext="ttf")
+        + fm.findSystemFonts(fontpaths=None, fontext="otf")
+        + fm.findSystemFonts(fontpaths=None, fontext="ttc")
+    )
+    candidates = []
+    for f in font_files:
+        try:
+            name = fm.FontProperties(fname=f).get_name()
+            candidates.append((name, f))
+        except Exception:
+            pass
+    for wanted in preferred_names:
+        for name, path in candidates:
+            if wanted.lower() in name.lower():
+                return path
+    common_paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSansNarrow-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSansNarrow-Regular.ttf",
+        "/System/Library/Fonts/Futura.ttc",
+        "C:\\Windows\\Fonts\\arialn.ttf",
+    ]
+    for p in common_paths:
+        if os.path.exists(p):
+            return p
+    return None
+
+FONT_PATH = find_font()
+if FONT_PATH is None:
+    raise FileNotFoundError("No suitable condensed font found on this system.")
+
+def load_font(size):
+    return ImageFont.truetype(FONT_PATH, size=size)
+
+# --- srt parsing with timestamps ---
+def parse_srt_with_times(raw):
+    """
+    Parse SRT-like content and return a list of dicts:
+    [{'start': seconds, 'end': seconds, 'text': str}, ...]
+    """
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n").strip()
+    blocks = re.split(r"\n\s*\n", raw)
+    items = []
+
+    for block in blocks:
+        lines = [ln.strip() for ln in block.split("\n") if ln.strip()]
+        if not lines:
+            continue
+
+        # Try to find the timestamp line (contains '-->')
+        time_line_idx = None
+        for idx, line in enumerate(lines):
+            if re.search(r"\d\d:\d\d:\d\d[\.,]\d\d\d\s+-->\s+\d\d:\d\d:\d\d[\.,]\d\d\d", line):
+                time_line_idx = idx
+                break
+
+        if time_line_idx is None:
+            # No timestamp -> treat whole block as text (default duration 2s)
+            text = "\n".join(lines)
+            items.append({"start": None, "end": None, "text": text})
+            continue
+
+        # Extract start and end times
+        time_str = lines[time_line_idx]
+        parts = re.split(r"\s*-->\s*", time_str)
+        if len(parts) != 2:
+            continue
+        start_str, end_str = parts
+        start_sec = srt_time_to_seconds(start_str)
+        end_sec = srt_time_to_seconds(end_str)
+
+        # Text lines are those after the timestamp line
+        text_lines = lines[time_line_idx + 1:]
+        text = "\n".join(text_lines).strip()
+        if not text:
+            continue
+
+        items.append({"start": start_sec, "end": end_sec, "text": text})
+
+    return items
+
+def srt_time_to_seconds(t):
+    """Convert 'HH:MM:SS,mmm' or 'HH:MM:SS.mmm' to seconds (float)."""
+    t = t.replace(",", ".")
+    if ":" not in t:
+        return float(t)
+    parts = t.split(":")
+    if len(parts) == 3:
+        h, m, s = parts
+        return int(h) * 3600 + int(m) * 60 + float(s)
+    elif len(parts) == 2:
+        m, s = parts
+        return int(m) * 60 + float(s)
+    else:
+        return float(t)
+
+# --- audio duration ---
+def get_audio_duration(filepath):
+    """Return duration in seconds using moviepy or ffprobe."""
+    if not filepath.exists():
+        raise FileNotFoundError(f"Audio file not found: {filepath}")
+    try:
+        from moviepy.audio.io.AudioFileClip import AudioFileClip
+        with AudioFileClip(str(filepath)) as audio:
+            return audio.duration
+    except ImportError:
+        # fallback to ffprobe
+        cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(filepath)
+        ]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffprobe failed: {result.stderr}")
+        return float(result.stdout.strip())
+
+# --- text rendering ---
+def measure(draw, text, font):
+    bbox = draw.multiline_textbbox((0, 0), text, font=font, spacing=SPACING, align="center")
+    return bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+def wrap_text(draw, text, font, max_width):
+    paragraphs = text.split("\n")
+    wrapped_paragraphs = []
+    for para in paragraphs:
+        words = para.split()
+        if not words:
+            wrapped_paragraphs.append("")
+            continue
+        lines = []
+        current = words[0]
+        for word in words[1:]:
+            trial = current + " " + word
+            w, _ = measure(draw, trial, font)
+            if w <= max_width:
+                current = trial
+            else:
+                lines.append(current)
+                current = word
+        lines.append(current)
+        wrapped_paragraphs.append("\n".join(lines))
+    return "\n".join(wrapped_paragraphs)
+
+def choose_font_size(draw, text):
+    n = len(text.replace("\n", " "))
+    start = max(24, min(110, int(165 - n * 1.25)))
+    for size in range(start, 17, -1):
+        font = load_font(size)
+        wrapped = wrap_text(draw, text, font, W - 2 * MARGIN_X)
+        w, h = measure(draw, wrapped, font)
+        if w <= W - 2 * MARGIN_X and h <= H - 2 * MARGIN_Y:
+            return size, wrapped
+    return 16, wrap_text(draw, text, load_font(16), W - 2 * MARGIN_X)
+
+def render_text_image(text):
+    """Render text to a PIL Image and return it (without saving)."""
+    img = Image.new("RGB", (W, H), BG)
+    draw = ImageDraw.Draw(img)
+    if text is None or text.strip() == "":
+        # black frame
+        return img
+    size, wrapped = choose_font_size(draw, text)
+    font = load_font(size)
+    w, h = measure(draw, wrapped, font)
+    x = (W - w) // 2
+    y = (H - h) // 2
+    draw.multiline_text(
+        (x, y),
+        wrapped,
+        font=font,
+        fill=FG,
+        spacing=SPACING,
+        align="center",
+    )
+    return img
+
+# --- video creation with MoviePy ---
+def create_video_with_moviepy(items, audio_duration):
+    """Use MoviePy to create MP4 with audio."""
+    try:
+        from moviepy.editor import ImageClip, concatenate_videoclips, ColorClip
+        from moviepy.audio.io.AudioFileClip import AudioFileClip
+    except ImportError:
+        print("MoviePy not installed. Falling back to ffmpeg.")
+        return create_video_with_ffmpeg(items, audio_duration)
+
+    clips = []
+    total_duration = 0.0
+    for item in items:
+        duration = item.get("duration", 0.0)
+        if duration <= 0:
+            duration = 2.0   # fallback
+        total_duration += duration
+        img = render_text_image(item["text"])
+        import numpy as np
+        frame = np.array(img)
+        clip = ImageClip(frame, duration=duration)
+        clips.append(clip)
+
+    if not clips:
+        print("No clips to concatenate.")
+        return
+
+    # Pad with black if video shorter than audio
+    if total_duration < audio_duration:
+        remaining = audio_duration - total_duration
+        black_clip = ColorClip(size=(W, H), color=BG, duration=remaining)
+        clips.append(black_clip)
+        total_duration = audio_duration
+
+    final = concatenate_videoclips(clips, method="compose")
+    # Trim if video longer than audio (MoviePy set_duration will cut)
+    if total_duration > audio_duration:
+        final = final.set_duration(audio_duration)
+
+    # Add audio
+    audio = AudioFileClip(str(AUDIO_FILE))
+    final = final.set_audio(audio)
+    # Ensure final duration matches audio (in case audio is shorter, but we padded/trimmed already)
+    final = final.set_duration(audio_duration)
+
+    final.write_videofile(str(OUTPUT_VIDEO), fps=24)
+    print(f"Video saved as {OUTPUT_VIDEO}")
+
+# --- video creation with ffmpeg (fallback) ---
+def create_video_with_ffmpeg(items, audio_duration):
+    """
+    Fallback: render each image to PNG, build concat file, then encode with ffmpeg.
+    Handles padding and trimming via -shortest.
+    """
+    OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
+    concat_file = OUTPUT_DIR / "concat.txt"
+    image_paths = []
+
+    total_duration = 0.0
+    for idx, item in enumerate(items, start=1):
+        duration = item.get("duration", 0.0)
+        if duration <= 0:
+            duration = 2.0
+        total_duration += duration
+
+        img = render_text_image(item["text"])
+        img_path = OUTPUT_DIR / f"frame_{idx:04d}.png"
+        img.save(img_path)
+        image_paths.append(img_path)
+
+        # Write concat file entry
+        with open(concat_file, "a", encoding="utf-8") as f:
+            f.write(f"file '{img_path.absolute()}'\n")
+            f.write(f"duration {duration:.3f}\n")
+
+    # If video shorter than audio, add a black frame to fill the gap
+    if total_duration < audio_duration:
+        remaining = audio_duration - total_duration
+        black_img = Image.new("RGB", (W, H), BG)
+        black_path = OUTPUT_DIR / "black.png"
+        black_img.save(black_path)
+        image_paths.append(black_path)
+        with open(concat_file, "a", encoding="utf-8") as f:
+            f.write(f"file '{black_path.absolute()}'\n")
+            f.write(f"duration {remaining:.3f}\n")
+        total_duration = audio_duration
+
+    if not image_paths:
+        print("No frames to encode.")
+        return
+
+    # ffmpeg requires an extra entry for the last frame (loop trick)
+    last = image_paths[-1]
+    with open(concat_file, "a", encoding="utf-8") as f:
+        f.write(f"file '{last.absolute()}'\n")
+
+    # Build ffmpeg command
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", str(concat_file),
+        "-i", str(AUDIO_FILE),
+        "-map", "0:v",          # video from first input
+        "-map", "1:a",          # audio from second input
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-shortest",            # trim to shortest (audio is the reference because we padded video)
+        str(OUTPUT_VIDEO)
+    ]
+    subprocess.run(cmd, check=True)
+    print(f"Video saved as {OUTPUT_VIDEO}")
+
+    # Optional: clean up temporary PNGs
+    # for p in image_paths:
+    #     p.unlink()
+    # concat_file.unlink()
+
+# --- main ---
+def main():
+    # Read subtitle file
+    raw = INPUT_FILE.read_text(encoding="utf-8")
+    items = parse_srt_with_times(raw)
+
+    if not items:
+        print("No subtitle blocks found.")
+        return
+
+    # If splitting into lines, expand each block into multiple items (same duration)
+    if SPLIT_INTO_LINES:
+        expanded = []
+        for item in items:
+            lines = [ln.strip() for ln in item["text"].split("\n") if ln.strip()]
+            if not lines:
+                continue
+            for line in lines:
+                expanded.append({"start": item["start"], "end": item["end"], "text": line})
+        items = expanded
+
+    # Compute duration for each item (if start/end given, else default 2s)
+    for item in items:
+        if item["start"] is not None and item["end"] is not None:
+            dur = item["end"] - item["start"]
+            if dur <= 0:
+                dur = 1.0
+        else:
+            dur = 2.0
+        item["duration"] = dur
+
+    # Get audio duration
+    try:
+        audio_duration = get_audio_duration(AUDIO_FILE)
+    except Exception as e:
+        print(f"Error reading audio: {e}. Proceeding without audio.")
+        audio_duration = sum(item["duration"] for item in items)  # fallback: use video length
+
+    # Try MoviePy first, fallback to ffmpeg
+    try:
+        create_video_with_moviepy(items, audio_duration)
+    except Exception as e:
+        print(f"MoviePy failed: {e}. Trying ffmpeg fallback...")
+        create_video_with_ffmpeg(items, audio_duration)
+
+if __name__ == "__main__":
+    main()
